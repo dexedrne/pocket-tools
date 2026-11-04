@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# offload -- keep bulky files on other machines instead of this laptop's small disk.
+#
+#   offload put <path>... [--host h]   copy each path to <host>:~/offload/<path relative to $HOME>, verify by
+#                                      checksum, and only then delete the local copy
+#   offload get <path>                 bring a stored path back to the same place (the remote copy is kept)
+#   offload ls [pattern]               list what is stored where
+#   offload df                         free space per host
+#
+# Hosts: OFFLOAD_HOSTS="nas1 nas2" (ssh aliases with key login), or one per line in ~/.config/offload/hosts.
+# Without --host, the host with the most free space is chosen.
+# Index: ~/.local/share/offload/index.tsv   (path <TAB> host <TAB> bytes <TAB> date)
+# Needs: ssh, rsync, flock, numfmt (coreutils). Only paths under $HOME are accepted.
+set -uo pipefail
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/offload/hosts
+if [ -n "${OFFLOAD_HOSTS:-}" ]; then read -r -a HOSTS <<< "$OFFLOAD_HOSTS"
+elif [ -r "$CONF" ]; then mapfile -t HOSTS < <(grep -v '^[[:space:]]*\(#\|$\)' "$CONF")
+else HOSTS=(); fi
+IDX=${XDG_DATA_HOME:-$HOME/.local/share}/offload/index.tsv
+ensure_idx() { mkdir -p "$(dirname "$IDX")"; touch "$IDX"; }
+
+rel() { local p; p=$(realpath -m -- "$1"); case "$p" in "$HOME"/*) echo "${p#"$HOME"/}";; *) echo "offload: only paths under \$HOME" >&2; return 1;; esac; }
+free_kb() { timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=8 "$1" 'df -Pk ~ | tail -1 | awk "{print \$4}"' 2>/dev/null || echo 0; }
+pick() { local best="" bk=0 h k; for h in "${HOSTS[@]}"; do k=$(free_kb "$h"); [ "${k:-0}" -gt "$bk" ] && { bk=$k; best=$h; }; done; echo "$best"; }
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+  put)
+    ensure_idx
+    host=""; args=()
+    while [ $# -gt 0 ]; do [ "$1" = --host ] && { host=$2; shift 2; continue; }; args+=("$1"); shift; done
+    [ ${#HOSTS[@]} -gt 0 ] || [ -n "$host" ] || { echo "offload: no hosts configured (OFFLOAD_HOSTS or $CONF)"; exit 1; }
+    [ -n "$host" ] || host=$(pick); [ -n "$host" ] || { echo "offload: no host reachable"; exit 1; }
+    for p in "${args[@]}"; do
+      r=$(rel "$p") || continue
+      [ -e "$HOME/$r" ] || { echo "missing: $p"; continue; }
+      bytes=$(du -sb "$HOME/$r" | cut -f1); d=$(dirname "$r")
+      ssh -o BatchMode=yes "$host" "mkdir -p ~/offload/'$d'" || { echo "mkdir failed on $host"; continue; }
+      # copy, then verify with a checksum dry-run: any difference listed means the copy is not identical
+      if rsync -a --partial -- "$HOME/$r" "$host:offload/$d/" \
+         && [ -z "$(rsync -anc --out-format='%n' -- "$HOME/$r" "$host:offload/$d/" | grep -v '/$')" ]; then
+        rm -rf -- "${HOME:?}/$r"
+        ( flock 8; grep -vF "$r	" "$IDX" > "$IDX.tmp.$$"; mv "$IDX.tmp.$$" "$IDX"
+          printf '%s\t%s\t%s\t%s\n' "$r" "$host" "$bytes" "$(date +%F)" >> "$IDX" ) 8>"$IDX.lock"
+        echo "stored $r on $host ($(numfmt --to=iec "$bytes"))"
+      else
+        echo "copy/verify failed for $r, kept locally"
+      fi
+    done ;;
+  get)
+    ensure_idx
+    r=$(rel "${1:?path}") || exit 1
+    host=$(awk -F'\t' -v r="$r" '$1==r{h=$2}END{print h}' "$IDX"); [ -n "$host" ] || { echo "not stored: $r"; exit 1; }
+    mkdir -p "$HOME/$(dirname "$r")" && rsync -a -- "$host:offload/$r" "$HOME/$(dirname "$r")/" \
+      && echo "restored $r from $host (copy kept on $host)" ;;
+  ls)
+    ensure_idx
+    { if [ -n "${1:-}" ]; then grep -i -- "$1" "$IDX"; else cat "$IDX"; fi; } \
+      | awk -F'\t' '{printf "%-10s %10s  %s  %s\n",$2,$3,$4,$1}' | numfmt --field=2 --to=iec --invalid=ignore ;;
+  df)
+    for h in "${HOSTS[@]}"; do printf '%-10s %s free\n' "$h" "$(numfmt --to=iec $(( $(free_kb "$h") * 1024 )))"; done ;;
+  *) sed -n 2,13p "$0" ;;
+esac

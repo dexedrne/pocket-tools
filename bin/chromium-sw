@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# chromium-sw -- run Chromium (headless tests, screenshots, scrapers) on SOFTWARE rendering only.
+#
+# Why: forcing a headless Chromium onto the GPU (--enable-gpu, --use-angle=vulkan, ...) hung the amdgpu
+# graphics ring twice in one day; the GPU reset took the whole Wayland session with it. Test tools love to pass
+# those flags. This wrapper DROPS every GPU-forcing flag it is given and appends the software ones
+# (SwiftShader/ANGLE, no GPU process), so a tool can set  CHROME=chromium-sw  and never touch the real GPU.
+#
+#   chromium-sw --headless --screenshot=out.png https://example.com
+#   CHROMIUM_SW_DRY=1 chromium-sw ...      print the final argument list instead of launching
+#   CHROMIUM_SW_BIN=/path/to/chromium      use a specific binary (otherwise the first one found)
+#
+# Remember: always pass --user-data-dir=<throwaway dir> for headless runs, or Chromium may use (and lock) your
+# real profile.
+bin=${CHROMIUM_SW_BIN:-}
+if [ -z "$bin" ]; then
+  for c in /usr/lib/chromium/chromium /usr/lib/chromium-browser/chromium-browser chromium chromium-browser google-chrome-stable google-chrome; do
+    if command -v "$c" >/dev/null 2>&1; then bin=$(command -v "$c"); break; fi
+  done
+fi
+[ -n "$bin" ] || { echo "chromium-sw: no Chromium binary found (set CHROMIUM_SW_BIN)" >&2; exit 127; }
+# on some distros /usr/bin/chromium is itself a wrapper script around /usr/lib/chromium/chromium; fine either way
+
+out=()
+for a in "$@"; do
+  case "$a" in
+    --enable-gpu|--enable-gpu-rasterization|--ignore-gpu-blocklist|--use-angle=*|--use-gl=*|--enable-zero-copy|\
+    --enable-features=Vulkan*|--enable-unsafe-webgpu|--use-vulkan*|--disable-gpu|--disable-software-rasterizer|\
+    --enable-unsafe-swiftshader|--ozone-platform=*) ;;                       # dropped
+    *) out+=("$a") ;;
+  esac
+done
+out+=(--use-angle=swiftshader --enable-unsafe-swiftshader --disable-gpu --ozone-platform=headless)
+
+if [ -n "${CHROMIUM_SW_DRY:-}" ]; then printf '%s\n' "$bin" "${out[@]}"; exit 0; fi
+exec "$bin" "${out[@]}"

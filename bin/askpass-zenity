@@ -1,0 +1,5 @@
+#!/bin/sh
+# askpass-zenity -- a password prompt window for `sudo -A` when there is no terminal
+# (commands launched from an editor, a menu, or a tool that has no tty).
+#   export SUDO_ASKPASS=$HOME/.local/bin/askpass-zenity ; sudo -A some-command
+exec zenity --password --title="sudo password"

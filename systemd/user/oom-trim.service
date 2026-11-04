@@ -1,0 +1,12 @@
+[Unit]
+Description=oom-trim: terminate the biggest recoverable memory hog before the kernel OOM killer stalls the desktop
+
+[Service]
+ExecStart=%h/.local/bin/oom-trim
+Restart=always
+RestartSec=5
+# make it the last thing the kernel would kill itself
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=default.target

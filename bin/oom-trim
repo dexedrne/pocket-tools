@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# oom-trim -- userspace memory-pressure guard for a desktop session (no root needed).
+#
+# The kernel OOM killer acts late: by the time it fires the compositor has usually been stalled
+# for tens of seconds. oom-trim watches MemAvailable and, while memory is low, terminates your own
+# biggest *recoverable* hog first (browsers, blender, electron apps), then the biggest process that
+# is not on the protect list. It never touches the compositor, shell, session or audio stack, and
+# it only ever signals processes owned by the user it runs as.
+#
+# Config (environment, or ~/.config/oom-trim.conf as KEY=VALUE lines):
+#   OOMTRIM_LOW_PCT=10        act when MemAvailable < this % of MemTotal
+#   OOMTRIM_MIN_RSS_MB=200    ignore processes smaller than this
+#   OOMTRIM_INTERVAL=3        seconds between checks
+#   OOMTRIM_PRIORITY="brave chrome chromium firefox blender electron"   comm prefixes, tried in order
+#   OOMTRIM_PROTECT_EXTRA=""  extra comm names (regex alternation) that must never be signalled
+#   OOMTRIM_DRY_RUN=1         log what would be killed, kill nothing
+set -u
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/oom-trim.conf"
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+LOW_PCT=${OOMTRIM_LOW_PCT:-10}
+MIN_RSS_KB=$(( ${OOMTRIM_MIN_RSS_MB:-200} * 1024 ))
+INTERVAL=${OOMTRIM_INTERVAL:-3}
+PRIORITY=${OOMTRIM_PRIORITY:-"brave chrome chromium firefox blender electron"}
+DRY=${OOMTRIM_DRY_RUN:-0}
+MEMINFO=${OOMTRIM_MEMINFO:-/proc/meminfo}     # overridable for tests
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/oom-trim.log"
+mkdir -p "$(dirname "$LOG")"
+
+# never signalled: compositors, shells, session plumbing, audio, this guard
+PROTECT='^(Hyprland|sway|river|niri|kwin_wayland|gnome-shell|Xorg|Xwayland|kitty|foot|alacritty|ghostty|waybar|swaync|hypridle|swayidle|awww-daemon|swww-daemon|sshd|systemd|\(sd-pam\)|dbus-broker|dbus-daemon|pipewire|wireplumber|pipewire-pulse|oom-trim|bash|zsh|fish|sh|gnome-keyring-d|login|agetty)$'
+[ -n "${OOMTRIM_PROTECT_EXTRA:-}" ] && PROTECT="${PROTECT%)\$}|${OOMTRIM_PROTECT_EXTRA})\$"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
+mem_kb() { awk -v k="$1" '$1==k":"{print $2}' "$MEMINFO"; }
+procs() { ps -u "$(id -u)" -o pid=,rss=,comm= --sort=-rss; }
+top_match() { procs | awk -v re="$1" -v min="$MIN_RSS_KB" '$3 ~ re && $2 >= min {print $1, $2, $3; exit}'; }
+top_unprotected() { procs | awk -v prot="$PROTECT" -v min="$MIN_RSS_KB" '$3 !~ prot && $2 >= min {print $1, $2, $3; exit}'; }
+
+trim() {   # trim <pid> <why>
+  if [ "$DRY" = 1 ]; then log "DRY-RUN would TERM pid=$1 ($2)"; return; fi
+  kill -TERM "$1" 2>/dev/null && log "TERM pid=$1 ($2) avail=$(mem_kb MemAvailable)kB"
+  sleep 2
+  kill -0 "$1" 2>/dev/null && { kill -KILL "$1" 2>/dev/null; log "KILL pid=$1 (did not exit)"; }
+}
+
+total=$(mem_kb MemTotal); limit=$(( total * LOW_PCT / 100 ))
+log "oom-trim started (act below ${limit}kB = ${LOW_PCT}% of ${total}kB, interval ${INTERVAL}s, dry-run=$DRY)"
+while :; do
+  avail=$(mem_kb MemAvailable)
+  if [ "${avail:-999999999}" -lt "$limit" ]; then
+    acted=0
+    for pat in $PRIORITY; do
+      read -r pid rss comm < <(top_match "^${pat}")
+      if [ -n "${pid:-}" ]; then trim "$pid" "priority:$comm rss=${rss}kB"; acted=1; break; fi
+    done
+    if [ "$acted" = 0 ]; then
+      read -r pid rss comm < <(top_unprotected)
+      [ -n "${pid:-}" ] && trim "$pid" "biggest:$comm rss=${rss}kB"
+    fi
+    [ "${OOMTRIM_ONESHOT:-0}" = 1 ] && exit 0
+    sleep 1
+  fi
+  [ "${OOMTRIM_ONESHOT:-0}" = 1 ] && exit 0
+  sleep "$INTERVAL"
+done
